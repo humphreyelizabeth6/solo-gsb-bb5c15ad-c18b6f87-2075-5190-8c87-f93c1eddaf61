@@ -21,6 +21,11 @@ seq 计数或随机状态。
 规则的请求，其指纹（方法/路径/查询参数/请求体/场景声明的 header 匹配字段）
 与响应随状态迁移在同一写事务落库；同 token/key 的重试指纹相同则直接返回
 首个响应（不渲染、不迁移、不新增事件），不同则返回 409。
+
+**批量会话版本迁移**（``migrate_sessions``）把一批会话从期望的源版本切换
+到目标版本：校验与迁移在同一个写事务中完成，任一会话不合格即整批回滚；
+迁移保留 context（含 seq/随机序列）与虚拟时钟，按目标版本的目标状态
+``after_ms`` 重建超时到期时刻，并清除这些会话的幂等回放记录。
 """
 from __future__ import annotations
 
@@ -789,6 +794,125 @@ def advance_session(token: str, delta_ms: int) -> dict[str, Any]:
     # 事务提交（含每步超时迁移事件）后唤醒事件流订阅者；回滚路径不发
     event_bus.publish()
     return result
+
+
+# ---------------------------------------------------------------------------
+# 批量会话版本迁移：POST /__scenarios/{name}/migrate-sessions
+# 在单个 IMMEDIATE 写事务中校验整批会话并切换其绑定版本/状态；
+# 任一会话不合格即整体回滚（与业务请求、advance 共用同一写锁，天然串行）
+# ---------------------------------------------------------------------------
+
+MAX_MIGRATE_TOKENS = 50
+
+
+def migrate_sessions(name: str, *, expected_revision: int, target_revision: int,
+                     state_mapping: dict[str, str],
+                     tokens: list[str]) -> dict[str, Any]:
+    """把一批会话从 ``expected_revision`` 迁移到 ``target_revision``。
+
+    校验与迁移在同一个 SQLite 写事务中完成：任一会话不存在、不属于该场景、
+    绑定版本与 ``expected_revision`` 不符、或当前状态未映射到目标版本的合法
+    状态，整批回滚（409，一个会话也不迁移）。迁移保留 context（含 ``_seq``
+    计数与 ``_rng`` 随机序列位置）与 ``clock_ms``，按目标版本中映射后状态的
+    ``after_ms`` 以「``clock_ms`` + ``after_ms``」重建超时到期时刻（目标状态
+    无超时则清空），并删除这些会话的幂等回放记录。不写事件、不改变场景的
+    当前版本。
+    """
+    target = store.get(name, target_revision)
+    if target is None:
+        raise SimAbort(404, {"error": "revision_not_found",
+                             "name": name, "revision": target_revision})
+
+    with write_tx() as conn:
+        # 第一遍：整批校验并规划，任何一会话不合格即抛错——此时未写入任何行，
+        # 事务回滚保证整批不变
+        planned: list[dict[str, Any]] = []
+        for token in tokens:
+            row = conn.execute(
+                "SELECT scenario, revision, state, clock_ms FROM sessions WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                raise SimAbort(409, {
+                    "error": "session_not_found", "token": token,
+                    "detail": "会话不存在；整批未做任何迁移",
+                    "migrated": 0, "rolled_back": True,
+                })
+            if row["scenario"] != name:
+                raise SimAbort(409, {
+                    "error": "scenario_mismatch", "token": token,
+                    "scenario": row["scenario"], "expected_scenario": name,
+                    "detail": "会话不属于该场景；整批未做任何迁移",
+                    "migrated": 0, "rolled_back": True,
+                })
+            revision = row["revision"]
+            if revision is None:  # 兜底：异常旧数据缺 revision 时按当前版本处理
+                revision = store.current_revision(name)
+            if revision != expected_revision:
+                raise SimAbort(409, {
+                    "error": "revision_mismatch", "token": token,
+                    "expected_revision": expected_revision,
+                    "actual_revision": revision,
+                    "detail": "会话绑定的源版本与 expected_revision 不符；整批未做任何迁移",
+                    "migrated": 0, "rolled_back": True,
+                })
+            from_state = row["state"]
+            to_state = state_mapping.get(from_state)
+            if to_state is None or to_state not in target.states:
+                raise SimAbort(409, {
+                    "error": "state_unmapped", "token": token, "state": from_state,
+                    "target_revision": target_revision,
+                    "target_states": target.states,
+                    "detail": f"当前状态 {from_state!r} 未映射到目标版本的合法状态；"
+                              "整批未做任何迁移",
+                    "migrated": 0, "rolled_back": True,
+                })
+            clock_ms = int(row["clock_ms"] or 0)
+            planned.append({
+                "token": token,
+                "from_revision": revision,
+                "from_state": from_state,
+                "to_state": to_state,
+                "clock_ms": clock_ms,
+                # 以当前虚拟时钟 + 目标状态 after_ms 重建到期时刻；无超时则清空
+                "timeout_at_ms": _timeout_due_at(target, to_state, clock_ms),
+            })
+
+        # 第二遍：整批校验全部通过，统一切换版本与映射后状态；
+        # context（含 _seq/_rng）与 clock_ms 不在更新列中，原样保留；
+        # 幂等回放记录随迁移失效删除，避免旧版本的响应被回放到新版本上
+        for item in planned:
+            conn.execute(
+                "UPDATE sessions SET revision = ?, state = ?, timeout_at_ms = ?,"
+                " updated_at = datetime('now') WHERE token = ?",
+                (target_revision, item["to_state"], item["timeout_at_ms"],
+                 item["token"]),
+            )
+            conn.execute("DELETE FROM idempotency_keys WHERE token = ?",
+                         (item["token"],))
+
+    # 不新增事件：无需唤醒事件流订阅者；场景当前版本（scenarios 表）保持不动
+    return {
+        "migrated": True,
+        "scenario": name,
+        "expected_revision": expected_revision,
+        "target_revision": target_revision,
+        "current_revision": store.current_revision(name),  # 迁移不改变场景当前版本
+        "migrated_count": len(planned),
+        "events_written": 0,
+        "sessions": [
+            {
+                "token": item["token"],
+                "from_revision": item["from_revision"],
+                "to_revision": target_revision,
+                "from_state": item["from_state"],
+                "to_state": item["to_state"],
+                "clock_ms": item["clock_ms"],
+                "timeout_at_ms": item["timeout_at_ms"],
+            }
+            for item in planned
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
