@@ -21,6 +21,15 @@ seq 计数或随机状态。
 规则的请求，其指纹（方法/路径/查询参数/请求体/场景声明的 header 匹配字段）
 与响应随状态迁移在同一写事务落库；同 token/key 的重试指纹相同则直接返回
 首个响应（不渲染、不迁移、不新增事件），不同则返回 409。
+
+此外提供**会话批量版本迁移**（``migrate_sessions``）：把 1~50 个会话从
+``expected_revision`` 整体迁移到 ``target_revision``。全部校验（会话存在、
+归属该场景、源版本相符、当前状态已映射到目标版本合法状态）与迁移更新在同一
+个 ``BEGIN IMMEDIATE`` 写事务中完成，与业务请求、时钟推进串行；任一会话
+校验失败即整体回滚，一个会话也不迁移。迁移保留 context（含 ``_seq`` 计数与
+``_rng`` 随机序列位置）与 ``clock_ms``，仅切换 revision 与映射后状态，并按
+目标版本目标状态的 ``after_ms`` 以当前 ``clock_ms`` 重建超时到期时刻（无超时
+则清空）；迁移会话的幂等回放记录一并删除。不新增事件，不改变场景当前版本。
 """
 from __future__ import annotations
 
@@ -789,6 +798,138 @@ def advance_session(token: str, delta_ms: int) -> dict[str, Any]:
     # 事务提交（含每步超时迁移事件）后唤醒事件流订阅者；回滚路径不发
     event_bus.publish()
     return result
+
+
+# ---------------------------------------------------------------------------
+# 会话批量版本迁移：POST /__scenarios/{name}/migrate-sessions
+# 在单个 IMMEDIATE 写事务中完成全部校验与迁移，与业务请求、时钟推进串行
+# ---------------------------------------------------------------------------
+
+MAX_MIGRATE_TOKENS = 50
+
+
+def migrate_sessions(name: str, tokens: list[str], expected_revision: int,
+                     target_revision: int,
+                     state_mapping: dict[str, str]) -> dict[str, Any]:
+    """把一批会话从 expected_revision 整体迁移到 target_revision。
+
+    全部校验（会话存在、归属该场景、源版本相符、当前状态已映射到目标版本
+    的合法状态）与迁移更新在同一个 ``BEGIN IMMEDIATE`` 写事务中完成：
+    任一会话校验失败即抛 :class:`SimAbort`（409）整体回滚，一个会话也不
+    迁移。迁移保留 context（含 ``_seq`` 计数与 ``_rng`` 随机序列位置）与
+    ``clock_ms``，仅切换 revision 与映射后状态，并按目标版本目标状态的
+    ``after_ms`` 以当前 ``clock_ms`` 重建超时到期时刻（无超时则清空）；
+    迁移会话的幂等回放记录一并删除。不新增事件，不改变场景当前版本。
+    """
+    target = store.get(name, target_revision)
+    if target is None:
+        if store.current_revision(name) is None:
+            raise SimAbort(404, {"error": "scenario_not_found", "name": name})
+        raise SimAbort(404, {"error": "revision_not_found",
+                             "name": name, "revision": target_revision})
+
+    with write_tx() as conn:
+        # 事务内复核场景与目标版本仍存在（与场景删除/激活等写操作串行）
+        scenario_row = conn.execute(
+            "SELECT current_revision FROM scenarios WHERE name = ?", (name,),
+        ).fetchone()
+        if scenario_row is None:
+            raise SimAbort(404, {"error": "scenario_not_found", "name": name})
+        revision_row = conn.execute(
+            "SELECT 1 FROM scenario_revisions WHERE scenario = ? AND revision = ?",
+            (name, target_revision),
+        ).fetchone()
+        if revision_row is None:
+            raise SimAbort(404, {"error": "revision_not_found",
+                                 "name": name, "revision": target_revision})
+
+        results: list[dict[str, Any]] = []
+        for index, token in enumerate(tokens):
+            row = conn.execute(
+                "SELECT scenario, revision, state, clock_ms FROM sessions WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                raise SimAbort(409, {
+                    "error": "session_not_found",
+                    "detail": f"第 {index} 个令牌 {token!r} 不存在；整批未迁移",
+                    "token": token, "token_index": index,
+                    "rolled_back": True, "migrated": 0,
+                })
+            if row["scenario"] != name:
+                raise SimAbort(409, {
+                    "error": "scenario_mismatch",
+                    "detail": f"会话 {token!r} 属于场景 {row['scenario']!r}，"
+                              f"不能通过场景 {name!r} 的迁移接口迁移；整批未迁移",
+                    "token": token, "token_index": index,
+                    "scenario": row["scenario"],
+                    "rolled_back": True, "migrated": 0,
+                })
+            if row["revision"] != expected_revision:
+                raise SimAbort(409, {
+                    "error": "revision_mismatch",
+                    "detail": f"会话 {token!r} 绑定的 revision 为 {row['revision']}，"
+                              f"与 expected_revision {expected_revision} 不符；整批未迁移",
+                    "token": token, "token_index": index,
+                    "expected_revision": expected_revision,
+                    "actual_revision": row["revision"],
+                    "rolled_back": True, "migrated": 0,
+                })
+            state = row["state"]
+            if state not in state_mapping:
+                raise SimAbort(409, {
+                    "error": "state_unmapped",
+                    "detail": f"会话 {token!r} 当前状态 {state!r} 未在状态名映射中；"
+                              "整批未迁移",
+                    "token": token, "token_index": index,
+                    "state": state,
+                    "mapped_states": sorted(state_mapping),
+                    "rolled_back": True, "migrated": 0,
+                })
+            new_state = state_mapping[state]
+            if new_state not in target.states:
+                raise SimAbort(409, {
+                    "error": "mapped_state_invalid",
+                    "detail": f"状态名映射把 {state!r} 映射到 {new_state!r}，但目标 "
+                              f"revision {target_revision} 未声明该状态；整批未迁移",
+                    "token": token, "token_index": index,
+                    "state": state, "mapped_state": new_state,
+                    "target_states": target.states,
+                    "rolled_back": True, "migrated": 0,
+                })
+
+            clock_ms = int(row["clock_ms"] or 0)
+            # 以当前虚拟时钟 + 目标版本目标状态的 after_ms 重建超时；无超时则清空
+            timeout_at_ms = _timeout_due_at(target, new_state, clock_ms)
+            conn.execute(
+                "UPDATE sessions SET revision = ?, state = ?, timeout_at_ms = ?,"
+                " updated_at = datetime('now') WHERE token = ?",
+                (target_revision, new_state, timeout_at_ms, token),
+            )
+            # 幂等回放记录随迁移失效：目标版本的规则与响应模板可能已变化
+            conn.execute("DELETE FROM idempotency_keys WHERE token = ?", (token,))
+            results.append({
+                "token": token,
+                "revision": {"before": row["revision"], "after": target_revision},
+                "state": {"before": state, "after": new_state},
+                "timeout_at_ms": timeout_at_ms,
+            })
+
+        payload = {
+            "migrated": True,
+            "scenario": name,
+            "expected_revision": expected_revision,
+            "target_revision": target_revision,
+            "current_revision": scenario_row["current_revision"],  # 当前版本不变
+            "count": len(results),
+            "sessions": results,
+            "events_added": 0,
+            "idempotency_cleared": True,
+            "detail": "整批迁移已在单个写事务中完成；context（含 seq 计数与随机序列"
+                      "位置）与 clock_ms 保持不变，超时按目标版本目标状态的 after_ms "
+                      "以 clock_ms 重建；未新增事件，场景当前版本未改变",
+        }
+    return payload
 
 
 # ---------------------------------------------------------------------------

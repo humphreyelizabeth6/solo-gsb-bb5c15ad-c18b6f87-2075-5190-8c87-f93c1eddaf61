@@ -10,7 +10,14 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..analysis import analyze_scenario
 from ..db import get_conn
-from ..engine import MAX_COMPARE_STEPS, CompareAbort, compare_revisions
+from ..engine import (
+    MAX_COMPARE_STEPS,
+    MAX_MIGRATE_TOKENS,
+    CompareAbort,
+    SimAbort,
+    compare_revisions,
+    migrate_sessions,
+)
 from ..scenario import ScenarioError, parse_scenario
 from ..store import store
 from .sessions import PreviewBody, _validate_seed
@@ -171,6 +178,65 @@ async def compare_scenario_versions(name: str, body: CompareBody) -> JSONRespons
             steps=steps,
         )
     except CompareAbort as exc:
+        return JSONResponse(status_code=exc.status_code, content=exc.body)
+    return JSONResponse(payload)
+
+
+# ---------------------------------------------------------------------------
+# 会话批量版本迁移：POST /__scenarios/{name}/migrate-sessions
+# ---------------------------------------------------------------------------
+
+class MigrateSessionsBody(BaseModel):
+    tokens: list[str] = Field(
+        description=f"待迁移的会话令牌：1~{MAX_MIGRATE_TOKENS} 个且不重复",
+        json_schema_extra={"minItems": 1, "maxItems": MAX_MIGRATE_TOKENS},
+    )
+    expected_revision: int = Field(
+        description="源版本：仅迁移当前绑定该 revision 的会话；不符的会话让整批 409 回滚",
+    )
+    target_revision: int = Field(
+        description="目标版本：迁移后会话绑定的 revision；不存在返回 404",
+    )
+    state_mapping: dict[str, str] = Field(
+        description="状态名映射：源状态名 -> 目标版本中的合法状态名；会话当前状态"
+                    "未映射、或映射目标在目标版本中未声明时整批 409 回滚",
+    )
+
+    @field_validator("tokens")
+    @classmethod
+    def _validate_tokens(cls, value: list[str]) -> list[str]:
+        if not 1 <= len(value) <= MAX_MIGRATE_TOKENS:
+            raise ValueError(
+                f"tokens 需为 1~{MAX_MIGRATE_TOKENS} 个，收到 {len(value)} 个")
+        if any(not token.strip() for token in value):
+            raise ValueError("tokens 不能包含空白令牌")
+        if len(set(value)) != len(value):
+            raise ValueError("tokens 不得重复")
+        return value
+
+
+@router.post("/{name}/migrate-sessions")
+async def migrate_scenario_sessions(name: str, body: MigrateSessionsBody) -> JSONResponse:
+    """**会话批量版本迁移**：把 1~50 个会话从 ``expected_revision`` 整体迁移到
+    ``target_revision``，并按 ``state_mapping`` 切换状态。
+
+    校验与迁移在**同一个 SQLite 写事务**中完成（与业务请求、时钟推进串行）：
+    目标 revision 不存在返回 404；任一会话不存在、不属于该场景、绑定版本与
+    ``expected_revision`` 不符、或当前状态未映射到目标版本的合法状态，返回
+    409 且**整批不变**。迁移保留 context（含 seq 计数与随机序列位置）与
+    ``clock_ms``，按目标版本目标状态的 ``after_ms`` 以 ``clock_ms`` 重建超时
+    （无超时则清空），并删除迁移会话的幂等回放记录；不新增事件，不改变场景
+    当前版本。成功时返回每个 token 的前后版本、前后状态与新到期时刻。
+    """
+    try:
+        payload = migrate_sessions(
+            name=name,
+            tokens=body.tokens,
+            expected_revision=body.expected_revision,
+            target_revision=body.target_revision,
+            state_mapping=body.state_mapping,
+        )
+    except SimAbort as exc:
         return JSONResponse(status_code=exc.status_code, content=exc.body)
     return JSONResponse(payload)
 

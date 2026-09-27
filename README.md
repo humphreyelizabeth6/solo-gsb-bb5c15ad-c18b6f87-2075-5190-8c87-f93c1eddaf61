@@ -56,6 +56,15 @@ SQLite 写事务**中落库；同一 token/key 且指纹相同的重试直接返
 请求体与场景 `when` 中声明的 `header` 匹配字段构成；重置或删除会话会清除
 该 token 的幂等记录，fork 的新 token 不继承记录，不带 key 的请求行为不变。
 
+既有会话还可**批量迁移到新版本**：`POST /__scenarios/{name}/migrate-sessions`
+接收 1~50 个不重复 token、`expected_revision`、`target_revision` 与状态名映射，
+在**同一个 SQLite 写事务**中完成全部校验与迁移（与业务请求、时钟推进串行）——
+目标版本不存在返回 404；任一会话不存在、不属该场景、源版本不符或当前状态未
+映射到目标合法状态，返回 409 且**整批不变**。迁移保留 context（含 `seq()` 计数
+与随机序列位置）与 `clock_ms`，仅切换绑定版本与映射后状态，并按目标版本目标
+状态的 `after_ms` 以 `clock_ms` 重建超时（无超时则清空），同时删除迁移会话的
+幂等记录；不新增事件，也不改变场景的当前版本。
+
 - 技术栈：Python 3.12 · FastAPI · SQLite（WAL）· Jinja2 沙箱模板 · PyYAML
 - 容器内启动即自动完成依赖安装与数据库初始化（含旧库就地升级），并自动加载 `scenarios/` 下的示例场景
 
@@ -76,6 +85,7 @@ docker compose up --build -d
 | 场景管理 | `http://localhost:8080/__scenarios` |
 | 状态可达性诊断 | `POST http://localhost:8080/__scenarios/analyze` |
 | 版本回归对比 | `POST http://localhost:8080/__scenarios/{name}/compare` |
+| 会话批量版本迁移 | `POST http://localhost:8080/__scenarios/{name}/migrate-sessions` |
 | 会话状态 | `http://localhost:8080/__sessions/{token}` |
 | 虚拟时钟推进 | `POST http://localhost:8080/__sessions/{token}/advance` |
 | 会话快照分支 | `POST http://localhost:8080/__sessions/{token}/fork` |
@@ -275,6 +285,7 @@ states:
 | GET | `/__scenarios/{name}/revisions` | **版本列表**：全部不可变 revision，标注当前版本 |
 | GET | `/__scenarios/{name}/revisions/{rev}` | 查看指定 revision 的解析结构 |
 | POST | `/__scenarios/{name}/compare` | **版本回归对比**：两个 revision 从各自 `initial_state` 建独立纯内存快照，同 seed 执行最多 20 步操作链（业务请求/时钟推进），逐步比较响应、状态、context、`clock_ms`、超时迁移；revision 不存在返回 404 |
+| POST | `/__scenarios/{name}/migrate-sessions` | **会话批量版本迁移**：1~50 个不重复 token 从 `expected_revision` 整体迁到 `target_revision` 并按状态名映射切换状态；单写事务内校验+迁移，任一失败整批 409 回滚；目标版本不存在 404；保留 context 与 `clock_ms`，按目标状态 `after_ms` 重建超时，清除迁移会话的幂等记录 |
 | POST | `/__scenarios/{name}/revisions/{rev}/activate` | **激活**指定 revision 为当前版本（只影响之后新建的会话）；目标不存在返回 404 |
 | DELETE | `/__scenarios/{name}` | 删除场景及其全部版本；仍有会话引用时返回 409，加 `?force=true` 级联删除 |
 
@@ -451,6 +462,83 @@ revision 1 尚未到期（30 分钟）而 revision 2 已自动取消（20 分钟
 规则（400）。若某一步某侧请求了不存在的路径，该侧该步为
 `{"ok": false, "failure": {"kind": "route", "status_code": 404, ...}}` 且快照
 不变，另一侧与后续步骤照常执行；对比结束后数据库中没有新增任何会话或事件。
+
+#### 会话批量版本迁移（migrate-sessions）
+
+`POST /__scenarios/{name}/migrate-sessions` 把**一批既有会话**从它们绑定的
+`expected_revision` 整体迁移到 `target_revision`——发布新版本后，不必丢弃
+进行中的联调会话，可以把它们平移到新版本继续执行。全部校验与迁移在**同一个
+SQLite 写事务**中完成，与业务请求、时钟推进串行：
+
+- 请求体四个字段：
+  - `tokens`：**1~50 个且不重复**的会话令牌（重复、空白、超出数量返回 422）；
+  - `expected_revision`：源版本——只迁移当前绑定该 revision 的会话；
+  - `target_revision`：目标版本——**不存在返回 404**（场景不存在同样 404）；
+  - `state_mapping`：状态名映射 `{源状态名: 目标状态名}`；
+- **任一失败，整批不变**（409，响应含 `rolled_back: true`、`migrated: 0` 与
+  首个失败令牌的 `token`/`token_index`）：
+  - `session_not_found`：会话不存在；
+  - `scenario_mismatch`：会话不属于该场景；
+  - `revision_mismatch`：会话绑定版本与 `expected_revision` 不符（响应含
+    `actual_revision`）；
+  - `state_unmapped`：会话当前状态未出现在 `state_mapping` 中；
+  - `mapped_state_invalid`：映射目标状态在目标 revision 中未声明（响应含
+    `target_states`）；
+- **迁移保留什么、改变什么**：`context`（含 `_seq` 计数器与 `_rng` 随机序列
+  位置）与 `clock_ms` 原样保留；仅切换 `revision` 与映射后状态，并按**目标
+  版本**目标状态的 `after_ms` 以当前 `clock_ms` 重建超时到期时刻（目标状态
+  无超时则清空 `timeout_at_ms`）；迁移会话的**幂等回放记录一并删除**（目标
+  版本的规则与响应模板可能已变化，旧 key 需重新执行）；
+- **不新增事件**（`events` 表不变，SSE 不推送），**不改变场景当前版本**
+  （响应中的 `current_revision` 可核对）；
+- 成功返回 200，`sessions` 数组按请求顺序给出每个 token 的**前后版本、
+  前后状态与新到期时刻**（`timeout_at_ms`，无超时为 `null`）。
+
+```bash
+# 场景：order-flow 已发布 revision 2（created 改名 awaiting_payment，
+# 超时 30 分钟 -> 10 分钟）；t1/t2 仍绑定 revision 1
+curl -s -X POST $BASE/__scenarios/order-flow/migrate-sessions \
+  -H 'Content-Type: application/json' -d '{
+    "tokens": ["t1", "t2"],
+    "expected_revision": 1,
+    "target_revision": 2,
+    "state_mapping": {"created": "awaiting_payment", "paid": "paid",
+                      "init": "init", "cancelled": "cancelled"}
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "migrated": true,
+  "scenario": "order-flow",
+  "expected_revision": 1,
+  "target_revision": 2,
+  "current_revision": 2,
+  "count": 2,
+  "sessions": [
+    {"token": "t1", "revision": {"before": 1, "after": 2},
+     "state": {"before": "created", "after": "awaiting_payment"},
+     "timeout_at_ms": 600100},
+    {"token": "t2", "revision": {"before": 1, "after": 2},
+     "state": {"before": "paid", "after": "paid"},
+     "timeout_at_ms": null}
+  ],
+  "events_added": 0,
+  "idempotency_cleared": true
+}
+```
+
+其中 `t1` 迁移前虚拟时钟为 `clock_ms=100`，目标状态 `awaiting_payment` 在
+revision 2 中声明了 `after_ms: 600000`，因此新到期时刻重建为
+`100 + 600000 = 600100`；`t2` 映射后的 `paid` 无超时，`timeout_at_ms` 清空。
+若 `t2` 实际绑定的是其他版本，则整批 409 回滚、`t1` 也保持原样：
+
+```json
+{"error": "revision_mismatch", "token": "t2", "token_index": 1,
+ "expected_revision": 1, "actual_revision": 2, "rolled_back": true, "migrated": 0}
+```
 
 #### 状态可达性诊断（analyze）
 
@@ -1104,11 +1192,11 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── models.py          # 场景/路由/规则/状态超时数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染、模板函数与会话级确定性随机源（seed）
-│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；幂等回放（指纹+首响应随事务落库）；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比
+│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；幂等回放（指纹+首响应随事务落库）；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比；会话批量版本迁移（单写事务校验+迁移）
 │   ├── event_bus.py       # 进程内事件总线：写事务提交后唤醒 SSE 订阅者（单 worker 权威）
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
-│       ├── scenarios.py   # 场景校验/状态可达性诊断/版本发布/版本列表/激活/查询/删除/版本回归对比
+│       ├── scenarios.py   # 场景校验/状态可达性诊断/版本发布/版本列表/激活/查询/删除/版本回归对比/会话批量版本迁移
 │       ├── sessions.py    # 会话创建/状态查询/advance 时钟推进/重置/fork/事件/预演
 │       └── events.py      # GET /__events/stream：SSE 事件订阅（游标补发+实时推送/token 过滤/心跳/422）
 ├── scenarios/
